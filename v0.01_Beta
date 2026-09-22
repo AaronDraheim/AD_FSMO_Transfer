@@ -1,0 +1,803 @@
+# This Sample Code is provided for the purpose of illustration only and is not intended to be used
+# in a production environment. THIS SAMPLE CODE AND ANY RELATED INFORMATION ARE PROVIDED "AS IS"
+# WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A PARTICULAR PURPOSE. We grant You a nonexclusive,
+# royalty-free right to use and modify the Sample Code and to reproduce and distribute the object code
+# form of the Sample Code, provided that You agree: (i) to not use Our name, logo, or trademarks to
+# market Your software product in which the Sample Code is embedded; (ii) to include a valid copyright
+# notice on Your software product in which the Sample Code is embedded; and (iii) to indemnify, hold
+# harmless, and defend Us and Our suppliers from and against any claims or lawsuits, including attorneys’
+# fees, that arise or result from the use or distribution of the Sample Code.
+# This sample script is not supported under any Microsoft standard support program or service.
+# The sample script is provided AS IS without warranty of any kind. Microsoft further disclaims
+# all implied warranties including, without limitation, any implied warranties of merchantability
+# or of fitness for a particular purpose. The entire risk arising out of the use or performance of
+# the sample scripts and documentation remains with you. In no event shall Microsoft, its authors,
+# or anyone else involved in the creation, production, or delivery of the scripts be liable for any
+# damages whatsoever (including, without limitation, damages for loss of business profits, business
+# interruption, loss of business information, or other pecuniary loss) arising out of the use of or
+# inability to use the sample scripts or documentation, even if Microsoft has been advised of the possibility of such damages.
+ 
+ 
+#requires -RunAsAdministrator
+ 
+<#
+.SYNOPSIS
+    Interactive and validated FSMO role transfer.
+ 
+.DESCRIPTION
+    Performs extensive pre-transfer validation, prompts the administrator
+    before making changes, transfers FSMO roles individually, and performs
+    extensive post-transfer validation.
+ 
+    Designed for a normal FSMO transfer between healthy domain controllers.
+ 
+    DOES NOT use -Force.
+ 
+.NOTES
+    Run from the destination DC or another writable domain controller.
+#>
+ 
+Import-Module ActiveDirectory -ErrorAction Stop
+ 
+Clear-Host
+ 
+# ============================================================
+# COLORS / OUTPUT HELPERS
+# ============================================================
+ 
+function Write-Header {
+    param([string]$Text)
+ 
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host " $Text" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+}
+ 
+function Write-Check {
+    param(
+        [string]$Name,
+        [bool]$Success,
+        [string]$Details
+    )
+ 
+    if ($Success) {
+        Write-Host "[PASS] " -ForegroundColor Green -NoNewline
+    }
+    else {
+        Write-Host "[FAIL] " -ForegroundColor Red -NoNewline
+    }
+ 
+    Write-Host "$Name - $Details"
+}
+ 
+function Write-WarningMessage {
+    param([string]$Text)
+ 
+    Write-Host "[WARN] $Text" -ForegroundColor Yellow
+}
+ 
+function Confirm-Continue {
+    param([string]$Message)
+ 
+    do {
+        $Answer = Read-Host "$Message [Y/N]"
+    }
+    while ($Answer -notmatch '^(Y|YES|N|NO)$')
+ 
+    if ($Answer -match '^(N|NO)$') {
+        Write-Host ""
+        Write-Host "Operation cancelled by administrator." -ForegroundColor Yellow
+        exit
+    }
+}
+ 
+# ============================================================
+# INITIAL INFORMATION
+# ============================================================
+ 
+Write-Header "FSMO ROLE TRANSFER - VALIDATED MODE"
+ 
+$Domain = Get-ADDomain
+$Forest = Get-ADForest
+$CurrentComputer = $env:COMPUTERNAME
+ 
+Write-Host ""
+Write-Host "Current Computer : $CurrentComputer"
+Write-Host "Domain           : $($Domain.DNSRoot)"
+Write-Host "Forest           : $($Forest.Name)"
+Write-Host "User             : $env:USERDOMAIN\$env:USERNAME"
+Write-Host ""
+ 
+# ============================================================
+# CURRENT FSMO HOLDERS
+# ============================================================
+ 
+Write-Header "CURRENT FSMO ROLE HOLDERS"
+ 
+Write-Host "PDC Emulator          : $($Domain.PDCEmulator)"
+Write-Host "RID Master             : $($Domain.RIDMaster)"
+Write-Host "Infrastructure Master : $($Domain.InfrastructureMaster)"
+Write-Host "Schema Master          : $($Forest.SchemaMaster)"
+Write-Host "Domain Naming Master   : $($Forest.DomainNamingMaster)"
+Write-Host ""
+ 
+# ============================================================
+# DOMAIN CONTROLLER DISCOVERY
+# ============================================================
+ 
+Write-Header "DOMAIN CONTROLLER DISCOVERY"
+ 
+$DCs = @(Get-ADDomainController -Filter * | Sort-Object HostName)
+ 
+if ($DCs.Count -lt 2) {
+    Write-Check `
+        "Multiple Domain Controllers" `
+        $false `
+        "Only $($DCs.Count) domain controller(s) detected."
+ 
+    Write-Host ""
+    Write-Host "A normal FSMO transfer requires another writable DC." `
+        -ForegroundColor Red
+ 
+    exit
+}
+ 
+for ($i = 0; $i -lt $DCs.Count; $i++) {
+ 
+    Write-Host "[$($i + 1)] $($DCs[$i].HostName)" `
+        -ForegroundColor White
+ 
+    Write-Host "    IPv4       : $($DCs[$i].IPv4Address)"
+    Write-Host "    Global Cat.: $($DCs[$i].IsGlobalCatalog)"
+    Write-Host "    Read Only  : $($DCs[$i].IsReadOnly)"
+    Write-Host ""
+}
+ 
+# ============================================================
+# TARGET SELECTION
+# ============================================================
+ 
+do {
+    $Selection = Read-Host `
+        "Enter the number of the DC that should receive ALL FSMO roles"
+}
+while (
+    $Selection -notmatch '^\d+$' -or
+    [int]$Selection -lt 1 -or
+    [int]$Selection -gt $DCs.Count
+)
+ 
+$TargetDC = $DCs[[int]$Selection - 1]
+ 
+Write-Host ""
+Write-Host "Selected destination:" -ForegroundColor Yellow
+Write-Host "    $($TargetDC.HostName)" -ForegroundColor White
+Write-Host "    $($TargetDC.IPv4Address)"
+Write-Host ""
+ 
+Confirm-Continue `
+    "Transfer FSMO roles to $($TargetDC.HostName)?"
+ 
+# ============================================================
+# PRE-TRANSFER VALIDATION
+# ============================================================
+ 
+Write-Header "PRE-TRANSFER VALIDATION"
+ 
+$ValidationFailed = $false
+ 
+# ------------------------------------------------------------
+# Target DC object
+# ------------------------------------------------------------
+ 
+try {
+ 
+    $TargetADDC = Get-ADDomainController `
+        -Identity $TargetDC.HostName `
+        -ErrorAction Stop
+ 
+    Write-Check `
+        "Domain Controller Discovery" `
+        $true `
+        "$($TargetADDC.HostName) found"
+}
+catch {
+ 
+    Write-Check `
+        "Domain Controller Discovery" `
+        $false `
+        $_.Exception.Message
+ 
+    $ValidationFailed = $true
+}
+ 
+# ------------------------------------------------------------
+# Writable DC
+# ------------------------------------------------------------
+ 
+$Writable = $TargetADDC.IsReadOnly -eq $false
+ 
+Write-Check `
+    "Writable Domain Controller" `
+    $Writable `
+    "IsReadOnly=$($TargetADDC.IsReadOnly)"
+ 
+if (-not $Writable) {
+    $ValidationFailed = $true
+}
+ 
+# ------------------------------------------------------------
+# Global Catalog
+# ------------------------------------------------------------
+ 
+$IsGC = $TargetADDC.IsGlobalCatalog
+ 
+Write-Check `
+    "Global Catalog" `
+    $IsGC `
+    "IsGlobalCatalog=$IsGC"
+ 
+if (-not $IsGC) {
+ 
+    Write-WarningMessage `
+        "Target is not currently a Global Catalog."
+}
+ 
+# ------------------------------------------------------------
+# Network connectivity
+# ------------------------------------------------------------
+ 
+$Ping = Test-Connection `
+    -ComputerName $TargetDC.HostName `
+    -Count 2 `
+    -Quiet
+ 
+Write-Check `
+    "Network Connectivity" `
+    $Ping `
+    "Ping to $($TargetDC.HostName)"
+ 
+if (-not $Ping) {
+    $ValidationFailed = $true
+}
+ 
+# ------------------------------------------------------------
+# DNS
+# ------------------------------------------------------------
+ 
+try {
+ 
+    $DNSResult = Resolve-DnsName `
+        $TargetDC.HostName `
+        -ErrorAction Stop
+ 
+    Write-Check `
+        "DNS Resolution" `
+        $true `
+        "$($TargetDC.HostName) resolves successfully"
+}
+catch {
+ 
+    Write-Check `
+        "DNS Resolution" `
+        $false `
+        "Unable to resolve target DC"
+ 
+    $ValidationFailed = $true
+}
+ 
+# ------------------------------------------------------------
+# AD Connectivity
+# ------------------------------------------------------------
+ 
+try {
+ 
+    $null = Get-ADDomainController `
+        -Identity $TargetDC.HostName `
+        -ErrorAction Stop
+ 
+    Write-Check `
+        "Active Directory Connectivity" `
+        $true `
+        "AD responds successfully"
+}
+catch {
+ 
+    Write-Check `
+        "Active Directory Connectivity" `
+        $false `
+        $_.Exception.Message
+ 
+    $ValidationFailed = $true
+}
+ 
+# ============================================================
+# SECURITY TOKEN VALIDATION
+# ============================================================
+ 
+Write-Header "ADMINISTRATIVE PERMISSION VALIDATION"
+ 
+$GroupOutput = whoami /groups 2>$null
+ 
+$HasDomainAdmins = $GroupOutput -match 'Domain Admins'
+$HasEnterpriseAdmins = $GroupOutput -match 'Enterprise Admins'
+$HasSchemaAdmins = $GroupOutput -match 'Schema Admins'
+ 
+Write-Check `
+    "Domain Admins Token" `
+    $HasDomainAdmins `
+    "Present in current security token"
+ 
+Write-Check `
+    "Enterprise Admins Token" `
+    $HasEnterpriseAdmins `
+    "Present in current security token"
+ 
+Write-Check `
+    "Schema Admins Token" `
+    $HasSchemaAdmins `
+    "Present in current security token"
+ 
+if (-not $HasDomainAdmins) {
+    $ValidationFailed = $true
+}
+ 
+if (-not $HasEnterpriseAdmins) {
+    $ValidationFailed = $true
+}
+ 
+if (-not $HasSchemaAdmins) {
+    $ValidationFailed = $true
+}
+ 
+if (-not $HasSchemaAdmins) {
+ 
+    Write-WarningMessage ""
+    Write-WarningMessage `
+        "Your account may be a member of Schema Admins in AD,"
+    Write-WarningMessage `
+        "but Schema Admins is NOT present in the current logon token."
+    Write-WarningMessage ""
+    Write-WarningMessage `
+        "Log off Windows and log back in before attempting the transfer."
+}
+ 
+# ============================================================
+# SYSVOL / DFSR VALIDATION
+# ============================================================
+ 
+Write-Header "SYSVOL / DFSR VALIDATION"
+ 
+# ------------------------------------------------------------
+# DFSR service
+# ------------------------------------------------------------
+ 
+$DFSRService = Get-Service `
+    -ComputerName $TargetDC.HostName `
+    -Name DFSR `
+    -ErrorAction SilentlyContinue
+ 
+$DFSRRunning = $DFSRService.Status -eq 'Running'
+ 
+Write-Check `
+    "DFSR Service" `
+    $DFSRRunning `
+    "Status=$($DFSRService.Status)"
+ 
+if (-not $DFSRRunning) {
+    $ValidationFailed = $true
+}
+ 
+# ------------------------------------------------------------
+# SYSVOL share
+# ------------------------------------------------------------
+ 
+$SYSVOLShare = Get-SmbShare `
+    -CimSession $TargetDC.HostName `
+    -Name SYSVOL `
+    -ErrorAction SilentlyContinue
+ 
+$SYSVOLExists = $null -ne $SYSVOLShare
+ 
+Write-Check `
+    "SYSVOL Share" `
+    $SYSVOLExists `
+    "SYSVOL share exists"
+ 
+if (-not $SYSVOLExists) {
+    $ValidationFailed = $true
+}
+ 
+# ------------------------------------------------------------
+# NETLOGON share
+# ------------------------------------------------------------
+ 
+$NETLOGONShare = Get-SmbShare `
+    -CimSession $TargetDC.HostName `
+    -Name NETLOGON `
+    -ErrorAction SilentlyContinue
+ 
+$NETLOGONExists = $null -ne $NETLOGONShare
+ 
+Write-Check `
+    "NETLOGON Share" `
+    $NETLOGONExists `
+    "NETLOGON share exists"
+ 
+if (-not $NETLOGONExists) {
+    $ValidationFailed = $true
+}
+ 
+# ------------------------------------------------------------
+# DFSR SYSVOL state
+# ------------------------------------------------------------
+ 
+try {
+ 
+    $DFSRState = dfsrdiag ReplicationState `
+        /member:$($TargetDC.HostName) 2>&1
+ 
+    Write-Check `
+        "DFSR Replication State" `
+        $true `
+        "DFSR responded successfully"
+}
+catch {
+ 
+    Write-Check `
+        "DFSR Replication State" `
+        $false `
+        "Unable to query DFSR state"
+ 
+    $ValidationFailed = $true
+}
+ 
+# ------------------------------------------------------------
+# SYSVOL / Advertising DCDIAG
+# ------------------------------------------------------------
+ 
+Write-Host ""
+Write-Host "Running current SYSVOL validation..." -ForegroundColor Cyan
+ 
+$SysVolDiag = dcdiag `
+    /s:$($TargetDC.HostName) `
+    /test:sysvolcheck `
+    /test:advertising `
+    /test:replications `
+    /q 2>&1
+ 
+$SysVolDiagText = $SysVolDiag -join "`n"
+ 
+if ([string]::IsNullOrWhiteSpace($SysVolDiagText)) {
+ 
+    Write-Check `
+        "SYSVOL / Advertising / Replication DCDIAG" `
+        $true `
+        "No current errors reported"
+}
+else {
+ 
+    Write-Check `
+        "SYSVOL / Advertising / Replication DCDIAG" `
+        $false `
+        "Current DCDIAG errors detected"
+ 
+    Write-Host ""
+    $SysVolDiag | ForEach-Object {
+        Write-Host $_ -ForegroundColor Red
+    }
+ 
+    $ValidationFailed = $true
+}
+ 
+# ============================================================
+# AD REPLICATION VALIDATION
+# ============================================================
+ 
+Write-Header "ACTIVE DIRECTORY REPLICATION VALIDATION"
+ 
+$ReplicationOutput = repadmin /replsummary 2>&1
+ 
+$ReplicationText = $ReplicationOutput -join "`n"
+ 
+Write-Host $ReplicationText
+ 
+# Look for actual failure counts.
+$ReplicationFailures =
+    $ReplicationText |
+    Select-String -Pattern '\d+\s*/\s*\d+\s+\d+%'
+ 
+# Look specifically for non-zero fail counts.
+$NonZeroReplicationFailures =
+    $ReplicationText |
+    Select-String -Pattern '[1-9]\d*\s*/\s*\d+'
+ 
+if ($NonZeroReplicationFailures) {
+ 
+    Write-Check `
+        "AD Replication" `
+        $false `
+        "Non-zero replication failures detected"
+ 
+    $ValidationFailed = $true
+}
+else {
+ 
+    Write-Check `
+        "AD Replication" `
+        $true `
+        "No replication failures detected"
+}
+ 
+# ============================================================
+# FINAL PRE-TRANSFER SUMMARY
+# ============================================================
+ 
+Write-Header "PRE-TRANSFER RESULT"
+ 
+if ($ValidationFailed) {
+ 
+    Write-Host ""
+    Write-Host "FSMO TRANSFER BLOCKED" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "One or more required validation checks failed."
+    Write-Host "No FSMO roles have been transferred by this script."
+    Write-Host ""
+ 
+    exit
+}
+ 
+Write-Host ""
+Write-Host "ALL REQUIRED VALIDATIONS PASSED." -ForegroundColor Green
+Write-Host ""
+ 
+Write-Host "The following roles will be transferred:" `
+    -ForegroundColor Yellow
+ 
+Write-Host ""
+Write-Host "  PDC Emulator"
+Write-Host "  RID Master"
+Write-Host "  Infrastructure Master"
+Write-Host "  Schema Master"
+Write-Host "  Domain Naming Master"
+Write-Host ""
+ 
+Write-Host "Destination:" -ForegroundColor Yellow
+Write-Host "  $($TargetDC.HostName)" -ForegroundColor Green
+Write-Host ""
+ 
+Confirm-Continue `
+    "FINAL CONFIRMATION - transfer ALL FSMO roles?"
+ 
+# ============================================================
+# FSMO TRANSFER
+# ============================================================
+ 
+Write-Header "FSMO ROLE TRANSFER"
+ 
+$Roles = @(
+    "PDCEmulator"
+    "RIDMaster"
+    "InfrastructureMaster"
+    "SchemaMaster"
+    "DomainNamingMaster"
+)
+ 
+$TransferFailed = $false
+ 
+foreach ($Role in $Roles) {
+ 
+    Write-Host ""
+    Write-Host "Transferring $Role..." -ForegroundColor Cyan
+ 
+    try {
+ 
+        Move-ADDirectoryServerOperationMasterRole `
+            -Identity $TargetDC.HostName `
+            -OperationMasterRole $Role `
+            -Confirm:$false `
+            -ErrorAction Stop
+ 
+        Write-Check `
+            "$Role Transfer" `
+            $true `
+            "Transfer command completed"
+    }
+    catch {
+ 
+        Write-Check `
+            "$Role Transfer" `
+            $false `
+            $_.Exception.Message
+ 
+        $TransferFailed = $true
+ 
+        Write-Host ""
+        Write-Host "Transfer stopped at $Role." `
+            -ForegroundColor Red
+ 
+        Write-Host ""
+        Write-Host "The roles already transferred remain transferred."
+        Write-Host "Run 'netdom query fsmo' to determine the current state."
+        Write-Host ""
+ 
+        break
+    }
+}
+ 
+# ============================================================
+# POST-TRANSFER FSMO VALIDATION
+# ============================================================
+ 
+Write-Header "POST-TRANSFER FSMO VALIDATION"
+ 
+Start-Sleep -Seconds 5
+ 
+$PostDomain = Get-ADDomain
+$PostForest = Get-ADForest
+ 
+$FSMOResults = @(
+    [PSCustomObject]@{
+        Role   = "PDC Emulator"
+        Holder = $PostDomain.PDCEmulator
+    }
+ 
+    [PSCustomObject]@{
+        Role   = "RID Master"
+        Holder = $PostDomain.RIDMaster
+    }
+ 
+    [PSCustomObject]@{
+        Role   = "Infrastructure Master"
+        Holder = $PostDomain.InfrastructureMaster
+    }
+ 
+    [PSCustomObject]@{
+        Role   = "Schema Master"
+        Holder = $PostForest.SchemaMaster
+    }
+ 
+    [PSCustomObject]@{
+        Role   = "Domain Naming Master"
+        Holder = $PostForest.DomainNamingMaster
+    }
+)
+ 
+$FSMOResults | Format-Table -AutoSize
+ 
+$AllFSMOCorrect = $true
+ 
+foreach ($Result in $FSMOResults) {
+ 
+    $HolderName = $Result.Holder.Split('.')[0]
+ 
+    $Correct = $HolderName `
+        -ieq $TargetADDC.HostName.Split('.')[0]
+ 
+    Write-Check `
+        $Result.Role `
+        $Correct `
+        "Holder=$($Result.Holder)"
+ 
+    if (-not $Correct) {
+        $AllFSMOCorrect = $false
+    }
+}
+ 
+# ============================================================
+# POST-TRANSFER REPLICATION
+# ============================================================
+ 
+Write-Header "POST-TRANSFER REPLICATION VALIDATION"
+ 
+$FinalReplication = repadmin /replsummary 2>&1
+ 
+$FinalReplicationText = $FinalReplication -join "`n"
+ 
+Write-Host $FinalReplicationText
+ 
+$FinalReplicationFailures =
+    $FinalReplicationText |
+    Select-String -Pattern '[1-9]\d*\s*/\s*\d+'
+ 
+if ($FinalReplicationFailures) {
+ 
+    Write-Check `
+        "Final AD Replication" `
+        $false `
+        "Replication failures detected"
+ 
+}
+else {
+ 
+    Write-Check `
+        "Final AD Replication" `
+        $true `
+        "No replication failures detected"
+}
+ 
+# ============================================================
+# POST-TRANSFER DCDIAG
+# ============================================================
+ 
+Write-Header "POST-TRANSFER DCDIAG"
+ 
+$FinalDCDiag = dcdiag `
+    /s:$($TargetDC.HostName) `
+    /test:advertising `
+    /test:sysvolcheck `
+    /test:replications `
+    /q 2>&1
+ 
+$FinalDCDiagText = $FinalDCDiag -join "`n"
+ 
+if ([string]::IsNullOrWhiteSpace($FinalDCDiagText)) {
+ 
+    Write-Check `
+        "Final DCDIAG" `
+        $true `
+        "Advertising, SYSVOL and replication are healthy"
+}
+else {
+ 
+    Write-Check `
+        "Final DCDIAG" `
+        $false `
+        "DCDIAG reported errors"
+ 
+    Write-Host ""
+    $FinalDCDiag | ForEach-Object {
+        Write-Host $_ -ForegroundColor Red
+    }
+}
+ 
+# ============================================================
+# FINAL RESULT
+# ============================================================
+ 
+Write-Header "FINAL RESULT"
+ 
+if ($AllFSMOCorrect -and -not $FinalReplicationFailures) {
+ 
+    Write-Host ""
+    Write-Host "FSMO TRANSFER SUCCESSFUL" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "All five FSMO roles are now held by:" `
+        -ForegroundColor Green
+    Write-Host ""
+    Write-Host "    $($TargetADDC.HostName)" `
+        -ForegroundColor White
+    Write-Host ""
+ 
+}
+elseif ($TransferFailed) {
+ 
+    Write-Host ""
+    Write-Host "FSMO TRANSFER PARTIALLY COMPLETED" `
+        -ForegroundColor Yellow
+ 
+    Write-Host ""
+    Write-Host "Some roles transferred before an error occurred."
+    Write-Host ""
+    Write-Host "Current FSMO state:"
+    Write-Host ""
+ 
+    netdom query fsmo
+ 
+}
+else {
+ 
+    Write-Host ""
+    Write-Host "FSMO TRANSFER COMPLETED WITH VALIDATION WARNINGS" `
+        -ForegroundColor Yellow
+ 
+    Write-Host ""
+    Write-Host "Review the validation results above."
+}
+ 
+Write-Host ""
+Write-Host "Recommended final command:"
+Write-Host "    netdom query fsmo"
+Write-Host ""
