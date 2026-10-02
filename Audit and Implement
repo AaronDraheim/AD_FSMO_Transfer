@@ -98,9 +98,17 @@ while ($Answer -notmatch '^(Y|YES|N|NO)$')
 if ($Answer -match '^(N|NO)$') { 
     Write-Host "" 
     Write-Host "Operation cancelled by administrator." -ForegroundColor Yellow 
+    Pause-BeforeExit 
     exit 
 } 
-  
+
+} 
+
+function Pause-BeforeExit { 
+
+Write-Host "" 
+Write-Host "Press Enter to close this window..." -ForegroundColor DarkGray 
+[void](Read-Host) 
 
 } 
 
@@ -186,6 +194,7 @@ if ($DCs.Count -lt 2) {
 Write-Host "" 
 Write-Host "A normal FSMO transfer requires another writable DC." -ForegroundColor Red 
  
+Pause-BeforeExit 
 exit 
 
 } 
@@ -295,11 +304,27 @@ Write-WarningMessage "Target is not currently a Global Catalog."
 
 # ------------------------------------------------------------ 
 
-$Ping = Test-Connection -ComputerName $TargetDC.HostName -Count 2 -Quiet 
+$PingOk = Test-Connection -ComputerName $TargetDC.HostName -Count 2 -Quiet 
 
-Write-Check "Network Connectivity" $Ping "Ping to $($TargetDC.HostName)" 
+$PortOk = $false 
+if (-not $PingOk) { 
+    try { 
+        $PortOk = (Test-NetConnection -ComputerName $TargetDC.HostName -Port 445 -WarningAction SilentlyContinue).TcpTestSucceeded 
+    } catch { 
+        $PortOk = $false 
+    } 
+} 
+$Reachable = $PingOk -or $PortOk 
+if ($PingOk) { 
+    Write-Check "Network Connectivity" $true "Ping to $($TargetDC.HostName) succeeded" 
+} elseif ($PortOk) { 
+    Write-Check "Network Connectivity" $true "Ping blocked, but SMB port 445 reachable on $($TargetDC.HostName)" 
+    Write-WarningMessage "ICMP ping did not respond. This is commonly caused by a firewall rule and does not necessarily mean the DC is unreachable." 
+} else { 
+    Write-Check "Network Connectivity" $false "Ping and port 445 both failed to reach $($TargetDC.HostName)" 
+} 
 
-if (-not $Ping) { $ValidationFailed = $true } 
+if (-not $Reachable) { $ValidationFailed = $true } 
 
 # ------------------------------------------------------------ 
 
@@ -532,6 +557,7 @@ Write-Host ""
 Write-Host "One or more required validation checks failed." 
 Write-Host "No FSMO roles have been transferred by this script." 
 Write-Host "" 
+Pause-BeforeExit 
 exit 
 
 } 
@@ -541,6 +567,7 @@ if ($AuditOnly) {
     Write-Host "FSMO READINESS AUDIT PASSED" -ForegroundColor Green 
     Write-Host "No FSMO roles were transferred." -ForegroundColor Yellow 
     Write-Host "" 
+    Pause-BeforeExit 
     exit 
 } 
 
